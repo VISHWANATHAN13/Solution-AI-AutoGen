@@ -3,6 +3,40 @@ import gradio as gr
 from groupchat import create_groupchat
 from groupchat_manager import create_groupchat_manager
 
+CONVERSATION_LOG = "conversation.txt"
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def message_text(message):
+    """Pull the plain text out of an AutoGen message.
+
+    `content` is usually a string, but can be a list of content blocks when
+    tool calls or multi-modal parts are involved.
+    """
+
+    content = message.get("content")
+
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict)
+        ]
+
+        return "\n".join(part for part in parts if part).strip()
+
+    return str(content).strip()
+
 
 # =========================================================
 # AUTOGEN DRIVER
@@ -13,46 +47,60 @@ def run_autogen(user_message):
     if not user_message or not user_message.strip():
         raise ValueError("Can't process empty message")
 
-    # Create AutoGen components
+    # The manager has to share this exact GroupChat instance.
     groupchat = create_groupchat()
-    manager = create_groupchat_manager()
+    manager = create_groupchat_manager(groupchat)
 
-    conversation = []
+    # agents[0] is the stakeholder proxy that seeds the discussion.
+    user_proxy = groupchat.agents[0]
 
     print("\n" + "=" * 60)
     print("AUTOGEN MULTI-AGENT EXECUTION")
     print("=" * 60)
-
-    print(f"\nUser: {user_message}")
+    print(f"\nUser: {user_message}\n")
 
     # -----------------------------------------------------
-    # Run all agents
+    # One group conversation, not one chat per agent
     # -----------------------------------------------------
 
-    for agent in groupchat.agents:
+    user_proxy.initiate_chat(
+        manager,
+        message=user_message,
+        clear_history=True
+    )
 
-        print(f"\n--- {agent.name} ---")
+    # -----------------------------------------------------
+    # groupchat.messages is the authoritative transcript.
+    # The manager never sends the discussion back to the
+    # initiator, so the returned ChatResult is not enough.
+    # Message 0 is the stakeholder's own prompt, so skip it.
+    # -----------------------------------------------------
 
-        response = agent.initiate_chat(
-            manager,
-            message=user_message
-        )
+    conversation = []
 
-        print(f"{agent.name}: {response}")
+    for message in groupchat.messages[1:]:
+
+        text = message_text(message)
+
+        if not text:
+            continue
+
+        agent_name = message.get("name") or message.get("role", "agent")
 
         conversation.append({
-            "agent": agent.name,
-            "response": str(response)
+            "agent": agent_name,
+            "response": text
         })
+
+        print(f"--- {agent_name} ---")
+        print(text + "\n")
 
     # -----------------------------------------------------
     # Store conversation
     # -----------------------------------------------------
 
-    file_name = "conversation.txt"
-
     with open(
-        file_name,
+        CONVERSATION_LOG,
         "a",
         encoding="utf-8"
     ) as f:
@@ -69,10 +117,10 @@ def run_autogen(user_message):
                 f"{item['response']}\n\n"
             )
 
-    print(f"\nConversation stored in {file_name}")
+    print(f"Conversation stored in {CONVERSATION_LOG}")
 
     # -----------------------------------------------------
-    # Final response
+    # Final response - the summarizer's last word
     # -----------------------------------------------------
 
     if conversation:
@@ -91,7 +139,10 @@ def run_autogen(user_message):
 # =========================================================
 # GRADIO CALLBACK
 # =========================================================
+
 def chat(user_message, history):
+
+    history = history or []
 
     if not user_message or not user_message.strip():
         return (
@@ -102,41 +153,41 @@ def chat(user_message, history):
 
     try:
 
-        # Run AutoGen
         final_response, conversation = run_autogen(
             user_message
         )
 
-        history = history or []
-
-        # Add user message
-        history.append({
-            "role": "user",
-            "content": user_message
-        })
-
-        # Add assistant response
-        history.append({
-            "role": "assistant",
-            "content": final_response
-        })
+        history = history + [
+            {
+                "role": "user",
+                "content": user_message
+            },
+            {
+                "role": "assistant",
+                "content": final_response
+            }
+        ]
 
         # -------------------------------------------------
         # Build Agent Execution Trace
         # -------------------------------------------------
 
-        trace = "## 🔍 Agent Execution Trace\n\n"
+        turn_counts = {}
+        trace_parts = []
 
-        for index, item in enumerate(
-            conversation,
-            start=1
-        ):
+        for item in conversation:
 
-            trace += (
-                f"### Agent {index}: {item['agent']}\n\n"
-                f"{item['response']}\n\n"
-                "---\n\n"
+            agent_name = item["agent"]
+
+            turn_counts[agent_name] = turn_counts.get(agent_name, 0) + 1
+
+            trace_parts.append(
+                f"### {agent_name} "
+                f"(turn {turn_counts[agent_name]})\n\n"
+                f"{item['response']}\n"
             )
+
+        trace = "\n---\n\n".join(trace_parts) or "No agent output."
 
         return (
             history,
@@ -147,8 +198,8 @@ def chat(user_message, history):
     except Exception as e:
 
         error_message = (
-            f"### ❌ Error\n\n"
-            f"`{str(e)}`"
+            f"### Error\n\n"
+            f"`{type(e).__name__}: {e}`"
         )
 
         return (
@@ -156,6 +207,7 @@ def chat(user_message, history):
             "",
             error_message
         )
+
 
 # =========================================================
 # GRADIO UI
@@ -194,18 +246,6 @@ def start_ui():
         )
 
         # -------------------------------------------------
-        # Agent Trace
-        # -------------------------------------------------
-
-        gr.Markdown(
-            "## 🔍 Agent Execution Trace"
-        )
-
-        agent_trace = gr.Markdown(
-            value="No agent execution yet."
-        )
-
-        # -------------------------------------------------
         # User Input
         # -------------------------------------------------
 
@@ -224,51 +264,41 @@ def start_ui():
                 scale=1
             )
 
-        # -------------------------------------------------
-        # Clear button
-        # -------------------------------------------------
-
         clear_button = gr.Button(
             "Clear Conversation"
         )
 
         # -------------------------------------------------
-        # Send button
+        # Agent Trace
         # -------------------------------------------------
+
+        with gr.Accordion(
+            "🔍 Agent Execution Trace",
+            open=True
+        ):
+
+            agent_trace = gr.Markdown(
+                value="No agent execution yet."
+            )
+
+        # -------------------------------------------------
+        # Wiring
+        # -------------------------------------------------
+
+        chat_inputs = [user_input, chatbot]
+        chat_outputs = [chatbot, user_input, agent_trace]
 
         send_button.click(
             fn=chat,
-            inputs=[
-                user_input,
-                chatbot
-            ],
-            outputs=[
-                chatbot,
-                user_input,
-                agent_trace
-            ]
+            inputs=chat_inputs,
+            outputs=chat_outputs
         )
-
-        # -------------------------------------------------
-        # Enter / Submit
-        # -------------------------------------------------
 
         user_input.submit(
             fn=chat,
-            inputs=[
-                user_input,
-                chatbot
-            ],
-            outputs=[
-                chatbot,
-                user_input,
-                agent_trace
-            ]
+            inputs=chat_inputs,
+            outputs=chat_outputs
         )
-
-        # -------------------------------------------------
-        # Clear
-        # -------------------------------------------------
 
         clear_button.click(
             fn=lambda: (
@@ -277,16 +307,8 @@ def start_ui():
                 "No agent execution yet."
             ),
             inputs=[],
-            outputs=[
-                chatbot,
-                user_input,
-                agent_trace
-            ]
+            outputs=chat_outputs
         )
-
-    # -----------------------------------------------------
-    # Launch
-    # -----------------------------------------------------
 
     demo.launch()
 
